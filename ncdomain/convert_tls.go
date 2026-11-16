@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -20,26 +21,26 @@ func (v *Value) appendTLSA(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, e
 	return out, nil
 }
 
-func parseTLSADANE(tlsa1dane interface{}, v *Value) error {
+func parseTLSADANE(tlsa1dane interface{}, v *Value, ps *parseState) error {
 	if tlsa, ok := tlsa1dane.([]interface{}); ok {
 		// Format: [1, 2, 3, "base64 certificate data"]
 		if len(tlsa) < 4 {
 			return fmt.Errorf("TLSA item must have four items")
 		}
 
-		a1, ok := tlsa[0].(float64)
+		a1, ok := validateUint(tlsa[0], 0, math.MaxUint8)
 		if !ok {
-			return fmt.Errorf("First item in TLSA value must be an integer (usage)")
+			return fmt.Errorf("First item in TLSA value must be an integer between 0 and %d (usage)", math.MaxUint8)
 		}
 
-		a2, ok := tlsa[1].(float64)
+		a2, ok := validateUint(tlsa[1], 0, math.MaxUint8)
 		if !ok {
-			return fmt.Errorf("Second item in TLSA value must be an integer (selector)")
+			return fmt.Errorf("Second item in TLSA value must be an integer between 0 and %d (selector)", math.MaxUint8)
 		}
 
-		a3, ok := tlsa[2].(float64)
+		a3, ok := validateUint(tlsa[2], 0, math.MaxUint8)
 		if !ok {
-			return fmt.Errorf("Third item in TLSA value must be an integer (match type)")
+			return fmt.Errorf("Third item in TLSA value must be an integer between 0 and %d (match type)", math.MaxUint8)
 		}
 
 		a4, ok := tlsa[3].(string)
@@ -50,6 +51,13 @@ func parseTLSADANE(tlsa1dane interface{}, v *Value) error {
 		a4b, err := base64.StdEncoding.DecodeString(a4)
 		if err != nil {
 			return fmt.Errorf("Fourth item in TLSA value must be valid base64: %v", err)
+		}
+
+		if len(v.TLSA) >= maxRecordsPerField {
+			return fmt.Errorf("tls field exceeds the maximum of %d records", maxRecordsPerField)
+		}
+		if !ps.recordReserved() {
+			return fmt.Errorf("record count limit exceeded (maximum %d records per value)", maxRecordsTotal)
 		}
 
 		a4h := hex.EncodeToString(a4b)
@@ -69,7 +77,7 @@ func parseTLSADANE(tlsa1dane interface{}, v *Value) error {
 	}
 }
 
-func parseTLSA(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
+func parseTLSA(rv map[string]interface{}, v *Value, ps *parseState) {
 	tlsa, ok := rv["tls"]
 	if !ok || tlsa == nil {
 		return
@@ -90,17 +98,17 @@ func parseTLSA(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
 			}
 
 			if tlsa1dane, ok := tlsa1m["dane"]; ok {
-				err := parseTLSADANE(tlsa1dane, v)
+				err := parseTLSADANE(tlsa1dane, v, ps)
 				if err == nil {
 					continue
 				}
-				errFunc.add(err)
+				ps.errFunc.add(err)
 			}
 
-			errFunc.add(fmt.Errorf("Unknown TLSA item format"))
+			ps.errFunc.add(fmt.Errorf("Unknown TLSA item format"))
 		}
 		return
 	}
 
-	errFunc.add(fmt.Errorf("Malformed TLSA field format"))
+	ps.errFunc.add(fmt.Errorf("Malformed TLSA field format"))
 }

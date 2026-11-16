@@ -11,6 +11,6 @@ func (v *Value) appendTLSA(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, e
 	return out, nil
 }
 
-func parseTLSA(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
+func parseTLSA(rv map[string]interface{}, v *Value, ps *parseState) {
 	v.TLSA = nil
 }

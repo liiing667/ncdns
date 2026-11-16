@@ -11,10 +11,28 @@ import "github.com/namecoin/ncdns/util"
 import "strings"
 import "strconv"
 import "reflect"
+import "math"
 
 const depthLimit = 16
 const mergeDepthLimit = 4
 const defaultTTL = 600
+
+// Bounds on how much data a single Namecoin value is allowed to produce.
+// Without these, a maliciously large JSON/CBOR value (or a chain of
+// import/delegate merges) can force ncdns to allocate unbounded amounts of
+// memory and to emit arbitrarily large DNS response sets.
+const (
+	// maxRecordsPerField limits the number of records accepted for any single
+	// record type (IP, NS, DS, TXT, SRV, MX, TLSA, ...) in one Value.
+	maxRecordsPerField = 1024
+	// maxRecordsTotal limits the total number of records produced by an entire
+	// ParseValue call, including records brought in via import/delegate and
+	// records nested in "map" subdomains.
+	maxRecordsTotal = 16384
+	// maxMapEntries limits the number of subdomain entries accepted in a single
+	// "map" object.
+	maxMapEntries = 1024
+)
 
 // Note: Name values in Value (e.g. those in Alias and Target, Services, MXs,
 // etc.) are not necessarily fully qualified and must be fully qualified before
@@ -346,6 +364,46 @@ func (ef ErrorFunc) addWarning(err error) {
 	}
 }
 
+// parseState carries the state shared by every Value produced by one
+// ParseValue call. It makes the import/delegate merge graph and the record
+// count budget global rather than per-subdomain, so a malicious value cannot
+// evade the limits by nesting records or re-importing names in subdomains.
+type parseState struct {
+	resolve     ResolveFunc
+	errFunc     ErrorFunc
+	mergedNames map[string]struct{}
+	recordsLeft int
+	budgetError bool
+}
+
+// recordReserved reserves one record against the global budget. It reports
+// false (and emits a single stable error) once the budget is exhausted.
+func (ps *parseState) recordReserved() bool {
+	if ps.recordsLeft <= 0 {
+		if !ps.budgetError {
+			ps.budgetError = true
+			ps.errFunc.add(fmt.Errorf("record count limit exceeded (maximum %d records per value)", maxRecordsTotal))
+		}
+		return false
+	}
+
+	ps.recordsLeft--
+	return true
+}
+
+// validateUint returns the integer value of x if it is a whole number within
+// [min, max]. JSON and CBOR numbers are decoded as float64, so fractional
+// values and values outside the target field's wire-format range are rejected
+// here instead of being silently truncated when cast to an unsigned integer.
+func validateUint(x interface{}, min, max float64) (uint64, bool) {
+	f, ok := x.(float64)
+	if !ok || f != float64(int64(f)) || f < min || f > max {
+		return 0, false
+	}
+
+	return uint64(f), true
+}
+
 // Call to convert a given JSON value to a parsed Namecoin domain value.
 //
 // If ResolveFunc is given, it will be called to obtain the values for domains
@@ -380,25 +438,29 @@ func ParseValue(name, jsonValue string, resolve ResolveFunc, errFunc ErrorFunc) 
 		}
 	}
 
-	mergedNames := map[string]struct{}{}
-	mergedNames[name] = struct{}{}
+	ps := &parseState{
+		resolve:     resolve,
+		errFunc:     errFunc,
+		mergedNames: map[string]struct{}{name: {}},
+		recordsLeft: maxRecordsTotal,
+	}
 
-	parse(rv, v, resolve, errFunc, 0, 0, "", "", mergedNames)
+	parse(rv, v, ps, 0, 0, "", "")
 	v.IsTopLevel = true
 
 	value = v
 	return
 }
 
-func parse(rv interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, subdomain, relname string, mergedNames map[string]struct{}) {
+func parse(rv interface{}, v *Value, ps *parseState, depth, mergeDepth int, subdomain, relname string) {
 	rvm, ok := rv.(map[string]interface{})
 	if !ok {
-		errFunc.add(fmt.Errorf("value is not an object"))
+		ps.errFunc.add(fmt.Errorf("value is not an object"))
 		return
 	}
 
 	if depth > depthLimit {
-		errFunc.add(fmt.Errorf("depth limit exceeded"))
+		ps.errFunc.add(fmt.Errorf("depth limit exceeded"))
 		return
 	}
 
@@ -409,35 +471,35 @@ func parse(rv interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, dep
 		v = &Value{}
 	}
 
-	ok, _ = parseDelegate(rvm, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames)
+	ok, _ = parseDelegate(rvm, v, ps, depth, mergeDepth, relname)
 	if ok {
 		return
 	}
 
-	_ = parseImport(rvm, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames)
+	_ = parseImport(rvm, v, ps, depth, mergeDepth, relname)
 	if ip, ok := rvm["ip"]; ok {
-		parseIP(rvm, v, errFunc, ip, false)
+		parseIP(rvm, v, ps, ip, false)
 	}
 	if ip6, ok := rvm["ip6"]; ok {
-		parseIP(rvm, v, errFunc, ip6, true)
+		parseIP(rvm, v, ps, ip6, true)
 	}
-	parseNS(rvm, v, errFunc, relname)
-	parseAlias(rvm, v, errFunc, relname)
-	parseTranslate(rvm, v, errFunc, relname)
-	parseHostmaster(rvm, v, errFunc)
-	parseDS(rvm, v, errFunc)
-	parseTXT(rvm, v, errFunc)
-	parseSRV(rvm, v, errFunc, relname)
-	parseMX(rvm, v, errFunc, relname)
-	parseTLSA(rvm, v, errFunc)
-	parseRevocations(rvm, v, errFunc)
-	parseMap(rvm, v, resolve, errFunc, depth, mergeDepth, relname)
+	parseNS(rvm, v, ps, relname)
+	parseAlias(rvm, v, ps, relname)
+	parseTranslate(rvm, v, ps, relname)
+	parseHostmaster(rvm, v, ps)
+	parseDS(rvm, v, ps)
+	parseTXT(rvm, v, ps)
+	parseSRV(rvm, v, ps, relname)
+	parseMX(rvm, v, ps, relname)
+	parseTLSA(rvm, v, ps)
+	parseRevocations(rvm, v, ps)
+	parseMap(rvm, v, ps, depth, mergeDepth, relname)
 	v.moveEmptyMapItems()
 
 	if subdomain != "" {
 		subv, err := v.FindSubdomainByName(subdomain)
 		if err != nil {
-			errFunc.add(fmt.Errorf("couldn't find subdomain by name in import or delegate item: %v", err))
+			ps.errFunc.add(fmt.Errorf("couldn't find subdomain by name in import or delegate item: %v", err))
 			return
 		}
 		*realv = *subv
@@ -477,27 +539,27 @@ func (v *Value) qualify(name, suffix, apexSuffix string) (string, bool) {
 	return s, true
 }
 
-func parseMerge(rv map[string]interface{}, mergeValue string, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, subdomain, relname string, mergedNames map[string]struct{}) error {
+func parseMerge(rv map[string]interface{}, mergeValue string, v *Value, ps *parseState, depth, mergeDepth int, subdomain, relname string) error {
 	var rv2 interface{}
 
 	if mergeDepth > mergeDepthLimit {
 		err := fmt.Errorf("merge depth limit exceeded")
-		errFunc.add(err)
+		ps.errFunc.add(err)
 		return err
 	}
 
 	err := json.Unmarshal([]byte(mergeValue), &rv2)
 	if err != nil {
 		err = fmt.Errorf("couldn't parse JSON to be merged: %v", err)
-		errFunc.add(err)
+		ps.errFunc.add(err)
 		return err
 	}
 
-	parse(rv2, v, resolve, errFunc, depth, mergeDepth, subdomain, relname, mergedNames)
+	parse(rv2, v, ps, depth, mergeDepth, subdomain, relname)
 	return nil
 }
 
-func parseIP(rv map[string]interface{}, v *Value, errFunc ErrorFunc, ipi interface{}, ipv6 bool) {
+func parseIP(rv map[string]interface{}, v *Value, ps *parseState, ipi interface{}, ipv6 bool) {
 	if ipv6 {
 		v.IP6 = nil
 	} else {
@@ -511,7 +573,7 @@ func parseIP(rv map[string]interface{}, v *Value, errFunc ErrorFunc, ipi interfa
 	if ipa, ok := ipi.([]interface{}); ok {
 		for _, ip := range ipa {
 			if ips, ok := ip.(string); ok {
-				addIP(rv, v, errFunc, ips, ipv6)
+				addIP(rv, v, ps, ips, ipv6)
 			}
 		}
 
@@ -519,14 +581,31 @@ func parseIP(rv map[string]interface{}, v *Value, errFunc ErrorFunc, ipi interfa
 	}
 
 	if ip, ok := ipi.(string); ok {
-		addIP(rv, v, errFunc, ip, ipv6)
+		addIP(rv, v, ps, ip, ipv6)
 	}
 }
 
-func addIP(rv map[string]interface{}, v *Value, errFunc ErrorFunc, ips string, ipv6 bool) {
+func pickIPs(v *Value, ipv6 bool) []net.IP {
+	if ipv6 {
+		return v.IP6
+	}
+	return v.IP
+}
+
+func addIP(rv map[string]interface{}, v *Value, ps *parseState, ips string, ipv6 bool) {
 	pip := net.ParseIP(ips)
 	if pip == nil || (pip.To4() == nil) != ipv6 {
-		errFunc.add(fmt.Errorf("malformed IP: %s", ips))
+		ps.errFunc.add(fmt.Errorf("malformed IP: %s", ips))
+		return
+	}
+
+	ips2 := pickIPs(v, ipv6)
+	if len(ips2) >= maxRecordsPerField {
+		ps.errFunc.add(fmt.Errorf("ip field exceeds the maximum of %d records", maxRecordsPerField))
+		return
+	}
+
+	if !ps.recordReserved() {
 		return
 	}
 
@@ -537,7 +616,7 @@ func addIP(rv map[string]interface{}, v *Value, errFunc ErrorFunc, ips string, i
 	}
 }
 
-func parseNS(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname string) {
+func parseNS(rv map[string]interface{}, v *Value, ps *parseState, relname string) {
 	// "dns" takes precedence
 	if dns, ok := rv["dns"]; ok && dns != nil {
 		rv["ns"] = dns
@@ -561,29 +640,36 @@ func parseNS(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname str
 			if !ok {
 				continue
 			}
-			addNS(rv, v, errFunc, s, relname)
+			addNS(rv, v, ps, s, relname)
 		}
 		return
 	case string:
 		s := ns.(string)
-		addNS(rv, v, errFunc, s, relname)
+		addNS(rv, v, ps, s, relname)
 		return
 	default:
-		errFunc.add(fmt.Errorf("unknown NS field format"))
+		ps.errFunc.add(fmt.Errorf("unknown NS field format"))
 	}
 }
 
-func addNS(rv map[string]interface{}, v *Value, errFunc ErrorFunc, s, relname string) {
+func addNS(rv map[string]interface{}, v *Value, ps *parseState, s, relname string) {
 	if !util.ValidateOwnerName(s) {
-		errFunc.add(fmt.Errorf("malformed domain name in NS field"))
+		ps.errFunc.add(fmt.Errorf("malformed domain name in NS field"))
 	}
 	if _, ok := (rv["_nsSet"].(map[string]struct{}))[s]; !ok {
+		if len(v.NS) >= maxRecordsPerField {
+			ps.errFunc.add(fmt.Errorf("ns field exceeds the maximum of %d records", maxRecordsPerField))
+			return
+		}
+		if !ps.recordReserved() {
+			return
+		}
 		v.NS = append(v.NS, s)
 		(rv["_nsSet"].(map[string]struct{}))[s] = struct{}{}
 	}
 }
 
-func parseAlias(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname string) {
+func parseAlias(rv map[string]interface{}, v *Value, ps *parseState, relname string) {
 	alias, ok := rv["alias"]
 	if !ok {
 		return
@@ -597,7 +683,7 @@ func parseAlias(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname 
 
 	if s, ok := alias.(string); ok {
 		if !util.ValidateRelOwnerName(s) {
-			errFunc.add(fmt.Errorf("malformed alias name"))
+			ps.errFunc.add(fmt.Errorf("malformed alias name"))
 			return
 		}
 
@@ -606,10 +692,10 @@ func parseAlias(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname 
 		return
 	}
 
-	errFunc.add(fmt.Errorf("unknown alias field format"))
+	ps.errFunc.add(fmt.Errorf("unknown alias field format"))
 }
 
-func parseTranslate(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname string) {
+func parseTranslate(rv map[string]interface{}, v *Value, ps *parseState, relname string) {
 	translate, ok := rv["translate"]
 	if !ok {
 		return
@@ -623,7 +709,7 @@ func parseTranslate(rv map[string]interface{}, v *Value, errFunc ErrorFunc, reln
 
 	if s, ok := translate.(string); ok {
 		if !util.ValidateRelOwnerName(s) {
-			errFunc.add(fmt.Errorf("malformed translate name"))
+			ps.errFunc.add(fmt.Errorf("malformed translate name"))
 			return
 		}
 		v.Translate = s
@@ -631,7 +717,7 @@ func parseTranslate(rv map[string]interface{}, v *Value, errFunc ErrorFunc, reln
 		return
 	}
 
-	errFunc.add(fmt.Errorf("unknown translate field format"))
+	ps.errFunc.add(fmt.Errorf("unknown translate field format"))
 }
 
 func isAllArray(x []interface{}) bool {
@@ -652,7 +738,7 @@ func isAllString(x []interface{}) bool {
 	return true
 }
 
-func parseImportImpl(rv map[string]interface{}, val *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, mergedNames map[string]struct{}, delegate bool) (bool, error) {
+func parseImportImpl(rv map[string]interface{}, val *Value, ps *parseState, depth, mergeDepth int, relname string, delegate bool) (bool, error) {
 	var err error
 	succeeded := false
 	xname := "import"
@@ -694,23 +780,23 @@ func parseImportImpl(rv map[string]interface{}, val *Value, resolve ResolveFunc,
 						}
 					}
 
-					if _, ok := mergedNames[k]; ok {
+					if _, ok := ps.mergedNames[k]; ok {
 						// already merged
 						continue
 					}
 
 					// ok
 					var dv string
-					dv, err = resolve(k)
+					dv, err = ps.resolve(k)
 					if err != nil {
 						continue
 					}
 
-					mergedNames[k] = struct{}{}
+					ps.mergedNames[k] = struct{}{}
 
-					err = parseMerge(rv, dv, val, resolve, errFunc, depth, mergeDepth+1, subs, relname, mergedNames)
+					err = parseMerge(rv, dv, val, ps, depth, mergeDepth+1, subs, relname)
 					if err != nil {
-						errFunc.add(err)
+						ps.errFunc.add(err)
 						continue
 					}
 
@@ -728,21 +814,21 @@ func parseImportImpl(rv map[string]interface{}, val *Value, resolve ResolveFunc,
 		err = fmt.Errorf("unknown import/delegate field format")
 	}
 
-	errFunc.add(err)
+	ps.errFunc.add(err)
 
 	return succeeded, err
 }
 
-func parseImport(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, mergedNames map[string]struct{}) error {
-	_, err := parseImportImpl(rv, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames, false)
+func parseImport(rv map[string]interface{}, v *Value, ps *parseState, depth, mergeDepth int, relname string) error {
+	_, err := parseImportImpl(rv, v, ps, depth, mergeDepth, relname, false)
 	return err
 }
 
-func parseDelegate(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, mergedNames map[string]struct{}) (bool, error) {
-	return parseImportImpl(rv, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames, true)
+func parseDelegate(rv map[string]interface{}, v *Value, ps *parseState, depth, mergeDepth int, relname string) (bool, error) {
+	return parseImportImpl(rv, v, ps, depth, mergeDepth, relname, true)
 }
 
-func parseHostmaster(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
+func parseHostmaster(rv map[string]interface{}, v *Value, ps *parseState) {
 	hm, ok := rv["email"]
 	if !ok || hm == nil {
 		return
@@ -750,7 +836,7 @@ func parseHostmaster(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
 
 	if s, ok := hm.(string); ok {
 		if !util.ValidateEmail(s) {
-			errFunc.add(fmt.Errorf("malformed e. mail address in email field"))
+			ps.errFunc.add(fmt.Errorf("malformed e. mail address in email field"))
 			return
 		}
 
@@ -758,10 +844,10 @@ func parseHostmaster(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
 		return
 	}
 
-	errFunc.add(fmt.Errorf("unknown email field format"))
+	ps.errFunc.add(fmt.Errorf("unknown email field format"))
 }
 
-func parseDS(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
+func parseDS(rv map[string]interface{}, v *Value, ps *parseState) {
 	rds, ok := rv["ds"]
 	if !ok || rds == nil {
 		return
@@ -771,40 +857,48 @@ func parseDS(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
 
 	if dsa, ok := rds.([]interface{}); ok {
 		for _, ds1 := range dsa {
+			if len(v.DS) >= maxRecordsPerField {
+				ps.errFunc.add(fmt.Errorf("ds field exceeds the maximum of %d records", maxRecordsPerField))
+				return
+			}
 			if ds, ok := ds1.([]interface{}); ok {
 				if len(ds) < 4 {
-					errFunc.add(fmt.Errorf("DS item must have four items"))
+					ps.errFunc.add(fmt.Errorf("DS item must have four items"))
 					continue
 				}
 
-				a1, ok := ds[0].(float64)
+				a1, ok := validateUint(ds[0], 0, math.MaxUint16)
 				if !ok {
-					errFunc.add(fmt.Errorf("First item in DS value must be an integer (key tag)"))
+					ps.errFunc.add(fmt.Errorf("First item in DS value must be an integer between 0 and %d (key tag)", math.MaxUint16))
 					continue
 				}
 
-				a2, ok := ds[1].(float64)
+				a2, ok := validateUint(ds[1], 0, math.MaxUint8)
 				if !ok {
-					errFunc.add(fmt.Errorf("Second item in DS value must be an integer (algorithm)"))
+					ps.errFunc.add(fmt.Errorf("Second item in DS value must be an integer between 0 and %d (algorithm)", math.MaxUint8))
 					continue
 				}
 
-				a3, ok := ds[2].(float64)
+				a3, ok := validateUint(ds[2], 0, math.MaxUint8)
 				if !ok {
-					errFunc.add(fmt.Errorf("Third item in DS value must be an integer (digest type)"))
+					ps.errFunc.add(fmt.Errorf("Third item in DS value must be an integer between 0 and %d (digest type)", math.MaxUint8))
 					continue
 				}
 
 				a4, ok := ds[3].(string)
 				if !ok {
-					errFunc.add(fmt.Errorf("Fourth item in DS value must be a string (digest)"))
+					ps.errFunc.add(fmt.Errorf("Fourth item in DS value must be a string (digest)"))
 					continue
 				}
 
 				a4b, err := base64.StdEncoding.DecodeString(a4)
 				if err != nil {
-					errFunc.add(fmt.Errorf("Fourth item in DS value must be valid base64: %v", err))
+					ps.errFunc.add(fmt.Errorf("Fourth item in DS value must be valid base64: %v", err))
 					continue
+				}
+
+				if !ps.recordReserved() {
+					return
 				}
 
 				a4h := hex.EncodeToString(a4b)
@@ -816,16 +910,16 @@ func parseDS(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
 					Digest:     a4h,
 				})
 			} else {
-				errFunc.add(fmt.Errorf("DS item must be an array"))
+				ps.errFunc.add(fmt.Errorf("DS item must be an array"))
 			}
 		}
 		return
 	}
 
-	errFunc.add(fmt.Errorf("malformed DS field format"))
+	ps.errFunc.add(fmt.Errorf("malformed DS field format"))
 }
 
-func parseTXT(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
+func parseTXT(rv map[string]interface{}, v *Value, ps *parseState) {
 	rtxt, ok := rv["txt"]
 	if !ok || rtxt == nil {
 		return
@@ -834,6 +928,10 @@ func parseTXT(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
 	if txta, ok := rtxt.([]interface{}); ok {
 		// ["...", "..."] or [["...", "..."], ["...", "..."]]
 		for _, vv := range txta {
+			if len(v.TXT) >= maxRecordsPerField {
+				ps.errFunc.add(fmt.Errorf("txt field exceeds the maximum of %d records", maxRecordsPerField))
+				return
+			}
 			if sa, ok := vv.([]interface{}); ok {
 				// [["...", "..."], ["...", "..."]]
 				a := []string{}
@@ -843,21 +941,30 @@ func parseTXT(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
 					}
 				}
 				if len(a) > 0 {
+					if !ps.recordReserved() {
+						return
+					}
 					v.TXT = append(v.TXT, a)
 				}
 			} else if s, ok := vv.(string); ok {
+				if !ps.recordReserved() {
+					return
+				}
 				v.TXT = append(v.TXT, segmentizeTXT(s))
 			} else {
-				errFunc.add(fmt.Errorf("malformed TXT value"))
+				ps.errFunc.add(fmt.Errorf("malformed TXT value"))
 				return
 			}
 		}
 	} else {
 		// "..."
 		if s, ok := rtxt.(string); ok {
+			if !ps.recordReserved() {
+				return
+			}
 			v.TXT = append(v.TXT, segmentizeTXT(s))
 		} else {
-			errFunc.add(fmt.Errorf("malformed TXT value"))
+			ps.errFunc.add(fmt.Errorf("malformed TXT value"))
 			return
 		}
 	}
@@ -890,7 +997,7 @@ func segmentizeTXT(txt string) (a []string) {
 	return
 }
 
-func parseMX(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname string) {
+func parseMX(rv map[string]interface{}, v *Value, ps *parseState, relname string) {
 	rmx, ok := rv["mx"]
 	if !ok || rmx == nil {
 		return
@@ -898,35 +1005,43 @@ func parseMX(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname str
 
 	if sa, ok := rmx.([]interface{}); ok {
 		for _, s := range sa {
-			parseSingleMX(rv, s, v, errFunc, relname)
+			parseSingleMX(rv, s, v, ps, relname)
 		}
 		return
 	}
 
-	errFunc.add(fmt.Errorf("malformed MX value"))
+	ps.errFunc.add(fmt.Errorf("malformed MX value"))
 }
 
-func parseSingleMX(rv map[string]interface{}, s interface{}, v *Value, errFunc ErrorFunc, relname string) {
+func parseSingleMX(rv map[string]interface{}, s interface{}, v *Value, ps *parseState, relname string) {
 	sa, ok := s.([]interface{})
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed MX value"))
+		ps.errFunc.add(fmt.Errorf("malformed MX value"))
 		return
 	}
 
 	if len(sa) < 2 {
-		errFunc.add(fmt.Errorf("malformed MX value"))
+		ps.errFunc.add(fmt.Errorf("malformed MX value"))
 		return
 	}
 
-	prio, ok := sa[0].(float64)
-	if !ok || prio < 0 {
-		errFunc.add(fmt.Errorf("malformed MX value"))
+	prio, ok := validateUint(sa[0], 0, math.MaxUint16)
+	if !ok {
+		ps.errFunc.add(fmt.Errorf("malformed MX value: first item must be an integer between 0 and %d (preference)", math.MaxUint16))
 		return
 	}
 
 	hostname, ok := sa[1].(string)
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed MX value"))
+		ps.errFunc.add(fmt.Errorf("malformed MX value: second item must be a string (mail exchanger)"))
+		return
+	}
+
+	if len(v.MX) >= maxRecordsPerField {
+		ps.errFunc.add(fmt.Errorf("mx field exceeds the maximum of %d records", maxRecordsPerField))
+		return
+	}
+	if !ps.recordReserved() {
 		return
 	}
 
@@ -937,7 +1052,7 @@ func parseSingleMX(rv map[string]interface{}, s interface{}, v *Value, errFunc E
 	})
 }
 
-func parseSRV(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname string) {
+func parseSRV(rv map[string]interface{}, v *Value, ps *parseState, relname string) {
 	rsvc, ok := rv["srv"]
 	if !ok || rsvc == nil {
 		return
@@ -947,48 +1062,56 @@ func parseSRV(rv map[string]interface{}, v *Value, errFunc ErrorFunc, relname st
 
 	if sa, ok := rsvc.([]interface{}); ok {
 		for _, s := range sa {
-			parseSingleService(rv, s, v, errFunc, relname)
+			parseSingleService(rv, s, v, ps, relname)
 		}
 	} else {
-		errFunc.add(fmt.Errorf("malformed service value"))
+		ps.errFunc.add(fmt.Errorf("malformed service value"))
 	}
 }
 
-func parseSingleService(rv map[string]interface{}, svc interface{}, v *Value, errFunc ErrorFunc, relname string) {
+func parseSingleService(rv map[string]interface{}, svc interface{}, v *Value, ps *parseState, relname string) {
 	svca, ok := svc.([]interface{})
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed service value"))
+		ps.errFunc.add(fmt.Errorf("malformed service value"))
 		return
 	}
 
 	if len(svca) < 4 {
-		errFunc.add(fmt.Errorf("malformed service value: must have four items"))
+		ps.errFunc.add(fmt.Errorf("malformed service value: must have four items"))
 		return
 	}
 
 	//servicesUsed[sname] = struct{}{}
 
-	priority, ok := svca[0].(float64)
+	priority, ok := validateUint(svca[0], 0, math.MaxUint16)
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed service value: third item must be an integer (priority)"))
+		ps.errFunc.add(fmt.Errorf("malformed service value: first item must be an integer between 0 and %d (priority)", math.MaxUint16))
 		return
 	}
 
-	weight, ok := svca[1].(float64)
+	weight, ok := validateUint(svca[1], 0, math.MaxUint16)
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed service value: fourth item must be an integer (weight)"))
+		ps.errFunc.add(fmt.Errorf("malformed service value: second item must be an integer between 0 and %d (weight)", math.MaxUint16))
 		return
 	}
 
-	port, ok := svca[2].(float64)
+	port, ok := validateUint(svca[2], 0, math.MaxUint16)
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed service value: fifth item must be an integer (port number)"))
+		ps.errFunc.add(fmt.Errorf("malformed service value: third item must be an integer between 0 and %d (port number)", math.MaxUint16))
 		return
 	}
 
 	hostname, ok := svca[3].(string)
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed service value: sixth item must be a string (target)"))
+		ps.errFunc.add(fmt.Errorf("malformed service value: fourth item must be a string (target)"))
+		return
+	}
+
+	if len(v.SRV) >= maxRecordsPerField {
+		ps.errFunc.add(fmt.Errorf("srv field exceeds the maximum of %d records", maxRecordsPerField))
+		return
+	}
+	if !ps.recordReserved() {
 		return
 	}
 
@@ -1006,7 +1129,7 @@ func parseSingleService(rv map[string]interface{}, svc interface{}, v *Value, er
 	})
 }
 
-func parseRevocations(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
+func parseRevocations(rv map[string]interface{}, v *Value, ps *parseState) {
 	rrev, ok := rv["revoke"]
 	if !ok || rrev == nil {
 		return
@@ -1016,34 +1139,42 @@ func parseRevocations(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
 
 	if sa, ok := rrev.([]interface{}); ok {
 		for _, s := range sa {
-			parseSingleRevocation(rv, s, v, errFunc)
+			parseSingleRevocation(rv, s, v, ps)
 		}
 	} else {
-		errFunc.add(fmt.Errorf("malformed revocation value"))
+		ps.errFunc.add(fmt.Errorf("malformed revocation value"))
 	}
 }
 
-func parseSingleRevocation(rv map[string]interface{}, rev interface{}, v *Value, errFunc ErrorFunc) {
+func parseSingleRevocation(rv map[string]interface{}, rev interface{}, v *Value, ps *parseState) {
 	reva, ok := rev.([]interface{})
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed revocation value"))
+		ps.errFunc.add(fmt.Errorf("malformed revocation value"))
 		return
 	}
 
 	if len(reva) < 2 {
-		errFunc.add(fmt.Errorf("malformed revocation value: must have two items"))
+		ps.errFunc.add(fmt.Errorf("malformed revocation value: must have two items"))
 		return
 	}
 
 	issuerHashPrefixHex, ok := reva[0].(string)
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed revocation value: first item must be a string (issuer hash prefix)"))
+		ps.errFunc.add(fmt.Errorf("malformed revocation value: first item must be a string (issuer hash prefix)"))
 		return
 	}
 
 	serialPrefixHex, ok := reva[1].(string)
 	if !ok {
-		errFunc.add(fmt.Errorf("malformed revocation value: second item must be a string (serial number prefix)"))
+		ps.errFunc.add(fmt.Errorf("malformed revocation value: second item must be a string (serial number prefix)"))
+		return
+	}
+
+	if len(v.Revocations) >= maxRecordsPerField {
+		ps.errFunc.add(fmt.Errorf("revoke field exceeds the maximum of %d records", maxRecordsPerField))
+		return
+	}
+	if !ps.recordReserved() {
 		return
 	}
 
@@ -1065,7 +1196,7 @@ func convServiceValue(x interface{}) (string, error) {
 	}
 }
 
-func parseMap(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string) {
+func parseMap(rv map[string]interface{}, v *Value, ps *parseState, depth, mergeDepth int, relname string) {
 	rmap, ok := rv["map"]
 	if !ok || rmap == nil {
 		return
@@ -1073,11 +1204,18 @@ func parseMap(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc 
 
 	m, ok := rmap.(map[string]interface{})
 	if !ok {
-		errFunc.add(fmt.Errorf("Map value must be an object"))
+		ps.errFunc.add(fmt.Errorf("Map value must be an object"))
 		return
 	}
 
+	mapEntries := 0
 	for mk, mv := range m {
+		if mapEntries >= maxMapEntries {
+			ps.errFunc.add(fmt.Errorf("map field exceeds the maximum of %d entries", maxMapEntries))
+			return
+		}
+		mapEntries++
+
 		if s, ok := mv.(string); ok {
 			// deprecated case: "map": { "": "127.0.0.1" }
 			mv = map[string]interface{}{"ip": []interface{}{s}}
@@ -1094,13 +1232,15 @@ func parseMap(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc 
 				v2 = v2e
 			}
 
-			mergedNames := map[string]struct{}{}
-			parse(mvm, v2, resolve, errFunc, depth+1, mergeDepth, "", relname, mergedNames)
+			// The parseState (merge graph and record budget) is shared with the
+			// whole Value tree, so subdomains cannot re-import names already
+			// merged elsewhere or accumulate records beyond the global budget.
+			parse(mvm, v2, ps, depth+1, mergeDepth, "", relname)
 
 			v.Map[mk] = v2
 
 		} else {
-			errFunc.add(fmt.Errorf("Value in map object must be an object or string"))
+			ps.errFunc.add(fmt.Errorf("Value in map object must be an object or string"))
 			continue
 		}
 	}
