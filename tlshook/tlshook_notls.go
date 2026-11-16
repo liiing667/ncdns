@@ -7,6 +7,16 @@ import (
 	"github.com/namecoin/ncdns/ncdomain"
 )
 
-func DomainValueHookTLS(qname string, ncv *ncdomain.Value) error {
+// LookupResult mirrors the TLS-enabled build's LookupResult so that backend
+// code does not need build-tag-specific call sites.
+type LookupResult struct {
+	StreamIsolationID string
+	ClaimVersion      string
+	Value             *ncdomain.Value
+	NoSuchName        bool
+}
+
+// DomainBaseValueHook is a no-op in builds without TLS support.
+func DomainBaseValueHook(qname string, result LookupResult) error {
 	return nil
 }

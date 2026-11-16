@@ -280,13 +280,28 @@ func (tx *btx) doUserDomain() (rrs []dns.RR, err error) {
 
 	d, err := tx.b.getNamecoinEntry(ncname, tx.streamIsolationID)
 	if err != nil {
+		if err == merr.ErrNoSuchDomain {
+			// Feed explicit NXDOMAIN results into the PKI cache as
+			// short-lived negative entries and invalidate any claim
+			// cached before the name disappeared.  Transient errors
+			// deliberately bypass the hook so they are never cached.
+			_ = tlshook.DomainBaseValueHook(tx.qname, tlshook.LookupResult{
+				StreamIsolationID: tx.streamIsolationID,
+				NoSuchName:        true,
+			})
+		}
+
 		return nil, err
 	}
 
 	// TODO: add callback variable "OnValueReferencedFunc" to backend options so that we don't pollute this function with every hook that we want
 	//       might need to add the other attributes of tx, and sn, to the callback variable for flexibility's sake
 	// This doesn't normally return errors, but any errors during execution will be logged.
-	_ = tlshook.DomainBaseValueHook(tx.qname, d.ncv)
+	_ = tlshook.DomainBaseValueHook(tx.qname, tlshook.LookupResult{
+		StreamIsolationID: tx.streamIsolationID,
+		ClaimVersion:      d.claimVersion,
+		Value:             d.ncv,
+	})
 
 	rrs, err = tx.doUnderDomain(d)
 	if err != nil {
@@ -298,10 +313,20 @@ func (tx *btx) doUserDomain() (rrs []dns.RR, err error) {
 
 // Keep domains in parsed format.
 type domain struct {
-	ncv *ncdomain.Value
+	ncv          *ncdomain.Value
+	claimVersion string
 }
 
-func (b *Backend) resolveNameCache(name, streamIsolationID string) *string {
+// cachedName stores a raw name_show JSON value together with the immutable
+// identity (txid:vout) of the claim it came from.  Keeping the claim version
+// alongside the value lets downstream consumers such as the TLS PKI cache key
+// entries by claim version and evict them as soon as the name changes.
+type cachedName struct {
+	jsonValue    string
+	claimVersion string
+}
+
+func (b *Backend) resolveNameCache(name, streamIsolationID string) *cachedName {
 	b.cacheMutex.Lock()
 	defer b.cacheMutex.Unlock()
 
@@ -311,7 +336,7 @@ func (b *Backend) resolveNameCache(name, streamIsolationID string) *string {
 	}
 
 	if dd, ok := cache.Get(name); ok {
-		v := dd.(*string)
+		v := dd.(*cachedName)
 
 		return v
 	}
@@ -319,7 +344,7 @@ func (b *Backend) resolveNameCache(name, streamIsolationID string) *string {
 	return nil
 }
 
-func (b *Backend) addNamecoinJSONToCache(name string, jsonValue *string, streamIsolationID string) {
+func (b *Backend) addNamecoinJSONToCache(name string, jsonValue *cachedName, streamIsolationID string) {
 	b.cacheMutex.Lock()
 	defer b.cacheMutex.Unlock()
 
@@ -336,20 +361,20 @@ func (b *Backend) addNamecoinJSONToCache(name string, jsonValue *string, streamI
 
 func (b *Backend) getNamecoinEntry(name, streamIsolationID string) (*domain, error) {
 	// Try the cache first
-	v := b.resolveNameCache(name, streamIsolationID)
+	entry := b.resolveNameCache(name, streamIsolationID)
 
 	// If the cache misses, resolve it via namecoind
-	if v == nil {
-		vv, err := b.resolveName(name, streamIsolationID)
+	if entry == nil {
+		result, err := b.resolveName(name, streamIsolationID)
 		if err != nil {
 			return nil, err
 		}
 
-		v = &vv
-		b.addNamecoinJSONToCache(name, v, streamIsolationID)
+		entry = &result
+		b.addNamecoinJSONToCache(name, entry, streamIsolationID)
 	}
 
-	d, err := b.jsonToDomain(name, *v, streamIsolationID)
+	d, err := b.jsonToDomain(name, entry, streamIsolationID)
 	if err != nil {
 		return nil, err
 	}
@@ -357,12 +382,12 @@ func (b *Backend) getNamecoinEntry(name, streamIsolationID string) (*domain, err
 	return d, nil
 }
 
-func (b *Backend) resolveName(name, streamIsolationID string) (jsonValue string, err error) {
+func (b *Backend) resolveName(name, streamIsolationID string) (entry cachedName, err error) {
 	if fv, ok := b.cfg.FakeNames[name]; ok {
 		if fv == "NX" {
-			return "", merr.ErrNoSuchDomain
+			return cachedName{}, merr.ErrNoSuchDomain
 		}
-		return fv, nil
+		return cachedName{jsonValue: fv}, nil
 	}
 
 	// The rpcclient package has quite a long timeout, far in excess of standard
@@ -371,7 +396,12 @@ func (b *Backend) resolveName(name, streamIsolationID string) (jsonValue string,
 	// Namecoin JSON-RPC seem sluggish sometimes.
 	result := make(chan struct{}, 1)
 	go func() {
-		jsonValue, err = b.nc.NameQuery(name, streamIsolationID)
+		var queryResult namecoin.NameResult
+		queryResult, err = b.nc.NameQueryResult(name, streamIsolationID)
+		entry = cachedName{
+			jsonValue:    queryResult.Value,
+			claimVersion: queryResult.ClaimVersion,
+		}
 		log.Errore(err, "failed to query namecoin")
 		result <- struct{}{}
 	}()
@@ -380,28 +410,34 @@ func (b *Backend) resolveName(name, streamIsolationID string) (jsonValue string,
 	case <-result:
 		return
 	case <-time.After(time.Duration(b.cfg.NamecoinTimeout) * time.Millisecond):
-		return "", fmt.Errorf("timeout")
+		return cachedName{}, fmt.Errorf("timeout")
 	}
 }
 
-func (b *Backend) jsonToDomain(name, jsonValue, streamIsolationID string) (*domain, error) {
+func (b *Backend) jsonToDomain(name string, entry *cachedName, streamIsolationID string) (*domain, error) {
 	d := &domain{}
 
 	resolveExtraIsolated := func(n string) (string, error) {
-		return b.resolveExtraName(n, streamIsolationID)
+		extra, err := b.resolveExtraName(n, streamIsolationID)
+		if err != nil {
+			return "", err
+		}
+
+		return extra.jsonValue, nil
 	}
 
-	v := ncdomain.ParseValue(name, jsonValue, resolveExtraIsolated, nil)
+	v := ncdomain.ParseValue(name, entry.jsonValue, resolveExtraIsolated, nil)
 	if v == nil {
 		return nil, fmt.Errorf("couldn't parse value")
 	}
 
 	d.ncv = v
+	d.claimVersion = entry.claimVersion
 
 	return d, nil
 }
 
-func (b *Backend) resolveExtraName(name, streamIsolationID string) (jsonValue string, err error) {
+func (b *Backend) resolveExtraName(name, streamIsolationID string) (cachedName, error) {
 	return b.resolveName(name, streamIsolationID)
 }
 
