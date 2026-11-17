@@ -1,6 +1,7 @@
 package ncdomain
 
 import "encoding/json"
+import "errors"
 import "net"
 import "fmt"
 import "github.com/fxamacker/cbor"
@@ -8,6 +9,7 @@ import "github.com/miekg/dns"
 import "encoding/base64"
 import "encoding/hex"
 import "github.com/namecoin/ncdns/util"
+import "sort"
 import "strings"
 import "strconv"
 import "reflect"
@@ -110,22 +112,36 @@ func (v *Value) RRs(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, error) {
 	suffix = dns.Fqdn(suffix)
 	apexSuffix = dns.Fqdn(apexSuffix)
 
-	out, _ = v.appendNSs(out, suffix, apexSuffix)
+	// RR generation for a single name is an all-or-nothing decision: any
+	// failure is collected and returned to the caller so that a partial
+	// RRset is never mistaken for a complete answer. Successfully generated
+	// records are still returned for diagnostic purposes, but callers must
+	// treat a non-nil error as a failed answer.
+	var errs []error
+	appendStep := func(f func([]dns.RR, string, string) ([]dns.RR, error)) {
+		var err error
+		out, err = f(out, suffix, apexSuffix)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	appendStep(v.appendNSs)
 	if len(v.NS) == 0 {
-		out, _ = v.appendTranslate(out, suffix, apexSuffix)
+		appendStep(v.appendTranslate)
 		if !v.HasTranslate {
-			out, _ = v.appendAlias(out, suffix, apexSuffix)
+			appendStep(v.appendAlias)
 			if !v.HasAlias {
-				out, _ = v.appendIPs(out, suffix, apexSuffix)
-				out, _ = v.appendIP6s(out, suffix, apexSuffix)
-				out, _ = v.appendTXTs(out, suffix, apexSuffix)
-				out, _ = v.appendMXs(out, suffix, apexSuffix)
-				out, _ = v.appendSRVs(out, suffix, apexSuffix)
-				out, _ = v.appendTLSA(out, suffix, apexSuffix)
+				appendStep(v.appendIPs)
+				appendStep(v.appendIP6s)
+				appendStep(v.appendTXTs)
+				appendStep(v.appendMXs)
+				appendStep(v.appendSRVs)
+				appendStep(v.appendTLSA)
 			}
 		}
 	}
-	out, _ = v.appendDSs(out, suffix, apexSuffix)
+	appendStep(v.appendDSs)
 
 	xout := out[il:]
 	for i := range xout {
@@ -135,6 +151,11 @@ func (v *Value) RRs(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, error) {
 		} else {
 			h.Name = suffix
 		}
+	}
+
+	if len(errs) > 0 {
+		return out, fmt.Errorf("couldn't generate complete RRset for %s: %w",
+			suffix, errors.Join(errs...))
 	}
 
 	return out, nil
@@ -177,9 +198,12 @@ func (v *Value) appendIP6s(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, e
 }
 
 func (v *Value) appendNSs(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, error) {
+	var errs []error
+
 	for _, ns := range v.NS {
 		qn, ok := v.qualify(ns, suffix, apexSuffix)
 		if !ok {
+			errs = append(errs, fmt.Errorf("bad NS name %q", ns))
 			continue
 		}
 
@@ -194,7 +218,7 @@ func (v *Value) appendNSs(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, er
 		})
 	}
 
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 func (v *Value) appendTXTs(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, error) {
@@ -230,9 +254,12 @@ func (v *Value) appendMXs(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, er
 }
 
 func (v *Value) appendSRVs(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, error) {
+	var errs []error
+
 	for _, svc := range v.SRV {
 		qn, ok := v.qualify(svc.Target, suffix, apexSuffix)
 		if !ok {
+			errs = append(errs, fmt.Errorf("bad SRV target %q", svc.Target))
 			continue
 		}
 
@@ -250,14 +277,14 @@ func (v *Value) appendSRVs(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, e
 		})
 	}
 
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 func (v *Value) appendAlias(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, error) {
 	if v.HasAlias {
 		qn, ok := v.qualify(v.Alias, suffix, apexSuffix)
 		if !ok {
-			return out, fmt.Errorf("bad alias")
+			return out, fmt.Errorf("bad alias %q", v.Alias)
 		}
 		out = append(out, &dns.CNAME{
 			Hdr: dns.RR_Header{
@@ -277,7 +304,7 @@ func (v *Value) appendTranslate(out []dns.RR, suffix, apexSuffix string) ([]dns.
 	if v.HasTranslate {
 		qn, ok := v.qualify(v.Translate, suffix, apexSuffix)
 		if !ok {
-			return out, fmt.Errorf("bad translate")
+			return out, fmt.Errorf("bad translate %q", v.Translate)
 		}
 		out = append(out, &dns.DNAME{
 			Hdr: dns.RR_Header{
@@ -295,22 +322,37 @@ func (v *Value) appendTranslate(out []dns.RR, suffix, apexSuffix string) ([]dns.
 
 func (v *Value) RRsRecursive(out []dns.RR, suffix, apexSuffix string) ([]dns.RR, error) {
 	out, err := v.RRs(out, suffix, apexSuffix)
+
+	var errs []error
 	if err != nil {
-		return nil, err
+		errs = append(errs, err)
 	}
 
-	for mk, mv := range v.Map {
+	// Iterate map keys in sorted order so that the generated RRset (and any
+	// failure) is deterministic. "*" sorts before alnum labels, preserving
+	// wildcard records ahead of their siblings.
+	mapKeys := make([]string, 0, len(v.Map))
+	for mk := range v.Map {
+		mapKeys = append(mapKeys, mk)
+	}
+	sort.Strings(mapKeys)
+
+	for _, mk := range mapKeys {
+		mv := v.Map[mk]
+
 		if !util.ValidateOwnerLabel(mk) && mk != "" && mk != "*" {
+			errs = append(errs, fmt.Errorf("invalid subdomain label %q under %s",
+				mk, dns.Fqdn(suffix)))
 			continue
 		}
 
 		out, err = mv.RRsRecursive(out, mk+"."+suffix, apexSuffix)
-		//if err != nil {
-		//	return nil, err
-		//}
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 func (v *Value) FindSubdomainByName(subdomain string) (*Value, error) {
