@@ -52,7 +52,7 @@ type Value struct {
 
 type Revocation struct {
 	IssuerHashPrefixHex string
-	SerialPrefixHex  string
+	SerialPrefixHex     string
 }
 
 func (v *Value) mkString(i string) string {
@@ -358,6 +358,14 @@ func (ef ErrorFunc) addWarning(err error) {
 // continues and recovers as much as possible; errFunc is called for all errors
 // and warnings if specified.
 func ParseValue(name, jsonValue string, resolve ResolveFunc, errFunc ErrorFunc) (value *Value) {
+	return ParseValueWithBudget(name, jsonValue, resolve, errFunc, nil)
+}
+
+// ParseValueWithBudget is like ParseValue, but enforces a per-request
+// resource budget (e.g. limiting the number of import/delegate reference
+// resolutions). rb may be nil, in which case no budget is enforced. Budget
+// violations are reported via errFunc like other errors.
+func ParseValueWithBudget(name, jsonValue string, resolve ResolveFunc, errFunc ErrorFunc, rb *RequestBudget) (value *Value) {
 	var rv interface{}
 	v := &Value{}
 
@@ -383,14 +391,14 @@ func ParseValue(name, jsonValue string, resolve ResolveFunc, errFunc ErrorFunc) 
 	mergedNames := map[string]struct{}{}
 	mergedNames[name] = struct{}{}
 
-	parse(rv, v, resolve, errFunc, 0, 0, "", "", mergedNames)
+	parse(rv, v, resolve, errFunc, 0, 0, "", "", mergedNames, rb)
 	v.IsTopLevel = true
 
 	value = v
 	return
 }
 
-func parse(rv interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, subdomain, relname string, mergedNames map[string]struct{}) {
+func parse(rv interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, subdomain, relname string, mergedNames map[string]struct{}, rb *RequestBudget) {
 	rvm, ok := rv.(map[string]interface{})
 	if !ok {
 		errFunc.add(fmt.Errorf("value is not an object"))
@@ -409,12 +417,12 @@ func parse(rv interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, dep
 		v = &Value{}
 	}
 
-	ok, _ = parseDelegate(rvm, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames)
+	ok, _ = parseDelegate(rvm, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames, rb)
 	if ok {
 		return
 	}
 
-	_ = parseImport(rvm, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames)
+	_ = parseImport(rvm, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames, rb)
 	if ip, ok := rvm["ip"]; ok {
 		parseIP(rvm, v, errFunc, ip, false)
 	}
@@ -431,7 +439,7 @@ func parse(rv interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, dep
 	parseMX(rvm, v, errFunc, relname)
 	parseTLSA(rvm, v, errFunc)
 	parseRevocations(rvm, v, errFunc)
-	parseMap(rvm, v, resolve, errFunc, depth, mergeDepth, relname)
+	parseMap(rvm, v, resolve, errFunc, depth, mergeDepth, relname, rb)
 	v.moveEmptyMapItems()
 
 	if subdomain != "" {
@@ -477,7 +485,7 @@ func (v *Value) qualify(name, suffix, apexSuffix string) (string, bool) {
 	return s, true
 }
 
-func parseMerge(rv map[string]interface{}, mergeValue string, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, subdomain, relname string, mergedNames map[string]struct{}) error {
+func parseMerge(rv map[string]interface{}, mergeValue string, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, subdomain, relname string, mergedNames map[string]struct{}, rb *RequestBudget) error {
 	var rv2 interface{}
 
 	if mergeDepth > mergeDepthLimit {
@@ -493,7 +501,7 @@ func parseMerge(rv map[string]interface{}, mergeValue string, v *Value, resolve 
 		return err
 	}
 
-	parse(rv2, v, resolve, errFunc, depth, mergeDepth, subdomain, relname, mergedNames)
+	parse(rv2, v, resolve, errFunc, depth, mergeDepth, subdomain, relname, mergedNames, rb)
 	return nil
 }
 
@@ -652,7 +660,7 @@ func isAllString(x []interface{}) bool {
 	return true
 }
 
-func parseImportImpl(rv map[string]interface{}, val *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, mergedNames map[string]struct{}, delegate bool) (bool, error) {
+func parseImportImpl(rv map[string]interface{}, val *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, mergedNames map[string]struct{}, rb *RequestBudget, delegate bool) (bool, error) {
 	var err error
 	succeeded := false
 	xname := "import"
@@ -699,6 +707,14 @@ func parseImportImpl(rv map[string]interface{}, val *Value, resolve ResolveFunc,
 						continue
 					}
 
+					// Account for this reference resolution against the
+					// per-request resource budget.
+					err = rb.AddReference()
+					if err != nil {
+						errFunc.add(err)
+						continue
+					}
+
 					// ok
 					var dv string
 					dv, err = resolve(k)
@@ -708,7 +724,7 @@ func parseImportImpl(rv map[string]interface{}, val *Value, resolve ResolveFunc,
 
 					mergedNames[k] = struct{}{}
 
-					err = parseMerge(rv, dv, val, resolve, errFunc, depth, mergeDepth+1, subs, relname, mergedNames)
+					err = parseMerge(rv, dv, val, resolve, errFunc, depth, mergeDepth+1, subs, relname, mergedNames, rb)
 					if err != nil {
 						errFunc.add(err)
 						continue
@@ -733,13 +749,13 @@ func parseImportImpl(rv map[string]interface{}, val *Value, resolve ResolveFunc,
 	return succeeded, err
 }
 
-func parseImport(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, mergedNames map[string]struct{}) error {
-	_, err := parseImportImpl(rv, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames, false)
+func parseImport(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, mergedNames map[string]struct{}, rb *RequestBudget) error {
+	_, err := parseImportImpl(rv, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames, rb, false)
 	return err
 }
 
-func parseDelegate(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, mergedNames map[string]struct{}) (bool, error) {
-	return parseImportImpl(rv, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames, true)
+func parseDelegate(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, mergedNames map[string]struct{}, rb *RequestBudget) (bool, error) {
+	return parseImportImpl(rv, v, resolve, errFunc, depth, mergeDepth, relname, mergedNames, rb, true)
 }
 
 func parseHostmaster(rv map[string]interface{}, v *Value, errFunc ErrorFunc) {
@@ -1049,7 +1065,7 @@ func parseSingleRevocation(rv map[string]interface{}, rev interface{}, v *Value,
 
 	v.Revocations = append(v.Revocations, &Revocation{
 		IssuerHashPrefixHex: issuerHashPrefixHex,
-		SerialPrefixHex: serialPrefixHex,
+		SerialPrefixHex:     serialPrefixHex,
 	})
 }
 
@@ -1065,7 +1081,7 @@ func convServiceValue(x interface{}) (string, error) {
 	}
 }
 
-func parseMap(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string) {
+func parseMap(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc ErrorFunc, depth, mergeDepth int, relname string, rb *RequestBudget) {
 	rmap, ok := rv["map"]
 	if !ok || rmap == nil {
 		return
@@ -1095,7 +1111,7 @@ func parseMap(rv map[string]interface{}, v *Value, resolve ResolveFunc, errFunc 
 			}
 
 			mergedNames := map[string]struct{}{}
-			parse(mvm, v2, resolve, errFunc, depth+1, mergeDepth, "", relname, mergedNames)
+			parse(mvm, v2, resolve, errFunc, depth+1, mergeDepth, "", relname, mergedNames, rb)
 
 			v.Map[mk] = v2
 

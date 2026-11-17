@@ -65,6 +65,26 @@
 ### items ncdns may store in its cache. The default value is 100.
 #cachemaxentries=150
 
+### Per-request resource budget. A single query can recursively expand
+### subdomains, merge imported values and produce many records; these limits
+### ensure an abnormal name declaration cannot consume unbounded resources.
+### Queries exceeding a limit fail with SERVFAIL and the exceeded budget
+### category is logged. Negative values disable the corresponding limit.
+###
+### Maximum size in bytes of a query name. The default value is 512.
+#maxquerybytes=512
+###
+### Maximum number of records in a single response. The default value is 512.
+#maxrecords=512
+###
+### Maximum number of import/delegate reference resolutions per query.
+### The default value is 64.
+#maxreferenceresolutions=64
+###
+### Maximum total size in bytes of a single response. The default value is
+### 65536.
+#maxresponsebytes=65536
+
 
 ### Nameserver Identity (Optional)
 ### ------------------------------

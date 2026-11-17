@@ -17,6 +17,7 @@ import (
 
 	"github.com/namecoin/ncdns/backend"
 	"github.com/namecoin/ncdns/namecoin"
+	"github.com/namecoin/ncdns/ncdomain"
 )
 
 var log, Log = xlog.New("ncdns.server")
@@ -42,14 +43,18 @@ type Config struct {
 	ZonePublicKey  string `default:"" usage:"Path to the DNSKEY ZSK public key file; if one is not specified, a temporary one is generated on startup and used only for the duration of that process"`
 	ZonePrivateKey string `default:"" usage:"Path to the ZSK's corresponding private key file"`
 
-	NamecoinRPCUsername   string `default:"" usage:"Namecoin RPC username"`
-	NamecoinRPCPassword   string `default:"" usage:"Namecoin RPC password"`
-	NamecoinRPCAddress    string `default:"127.0.0.1:8336" usage:"Namecoin RPC server address"`
-	NamecoinRPCCookiePath string `default:"" usage:"Namecoin RPC cookie path (used if password is unspecified)"`
-	NamecoinRPCTimeout    int    `default:"1500" usage:"Timeout (in milliseconds) for Namecoin RPC requests"`
-	CacheMaxEntries       int    `default:"100" usage:"Maximum name cache entries"`
-	SelfName              string `default:"" usage:"The FQDN of this nameserver. If empty, a pseudo-hostname is generated."`
-	SelfIP                string `default:"127.127.127.127" usage:"The canonical IP address for this service"`
+	NamecoinRPCUsername     string `default:"" usage:"Namecoin RPC username"`
+	NamecoinRPCPassword     string `default:"" usage:"Namecoin RPC password"`
+	NamecoinRPCAddress      string `default:"127.0.0.1:8336" usage:"Namecoin RPC server address"`
+	NamecoinRPCCookiePath   string `default:"" usage:"Namecoin RPC cookie path (used if password is unspecified)"`
+	NamecoinRPCTimeout      int    `default:"1500" usage:"Timeout (in milliseconds) for Namecoin RPC requests"`
+	CacheMaxEntries         int    `default:"100" usage:"Maximum name cache entries"`
+	MaxQueryBytes           int    `default:"512" usage:"Per-request budget: maximum size in bytes of a query name; larger queries fail with SERVFAIL (negative: unlimited)"`
+	MaxRecords              int    `default:"512" usage:"Per-request budget: maximum number of records in a single response; exceeded responses fail with SERVFAIL (negative: unlimited)"`
+	MaxReferenceResolutions int    `default:"64" usage:"Per-request budget: maximum number of import/delegate reference resolutions per query; exceeded queries fail with SERVFAIL (negative: unlimited)"`
+	MaxResponseBytes        int    `default:"65536" usage:"Per-request budget: maximum total size in bytes of a single response; exceeded responses fail with SERVFAIL (negative: unlimited)"`
+	SelfName                string `default:"" usage:"The FQDN of this nameserver. If empty, a pseudo-hostname is generated."`
+	SelfIP                  string `default:"127.127.127.127" usage:"The canonical IP address for this service"`
 
 	HTTPListenAddr string `default:"" usage:"Address for webserver to listen at (default: disabled)"`
 
@@ -129,6 +134,12 @@ func New(cfg *Config) (s *Server, err error) {
 		Hostmaster:           cfg.Hostmaster,
 		CanonicalNameservers: s.cfg.canonicalNameservers,
 		VanityIPs:            s.cfg.vanityIPs,
+		Budget: ncdomain.Budget{
+			MaxQueryBytes:           cfg.MaxQueryBytes,
+			MaxRecords:              cfg.MaxRecords,
+			MaxReferenceResolutions: cfg.MaxReferenceResolutions,
+			MaxResponseBytes:        cfg.MaxResponseBytes,
+		},
 	})
 	if err != nil {
 		return

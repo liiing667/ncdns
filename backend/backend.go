@@ -1,5 +1,6 @@
 package backend
 
+import "errors"
 import "github.com/miekg/dns"
 import "github.com/golang/groupcache/lru"
 import "gopkg.in/hlandau/madns.v2/merr"
@@ -55,6 +56,11 @@ type Config struct {
 	// Map names (like "d/example") to strings containing JSON values. Used to provide
 	// fake names for testing purposes. You don't need to use this.
 	FakeNames map[string]string
+
+	// Per-request resource budget limiting query size, record count,
+	// reference resolutions and total response bytes. Zero fields use the
+	// defaults documented in ncdomain; negative fields disable a limit.
+	Budget ncdomain.Budget
 }
 
 // Creates a new Namecoin backend.
@@ -63,6 +69,7 @@ func New(cfg *Config) (backend *Backend, err error) {
 
 	b.cfg = *cfg
 	b.nc = b.cfg.NamecoinConn
+	b.cfg.Budget = b.cfg.Budget.Normalize()
 
 	b.caches = make(map[string]*lru.Cache)
 
@@ -108,11 +115,46 @@ func (b *Backend) Lookup(qname, streamIsolationID string) (rrs []dns.RR, err err
 		return
 	}
 
+	rb := ncdomain.NewRequestBudget(b.cfg.Budget)
+
+	err = rb.CheckQueryBytes(len(qname))
+	if err != nil {
+		b.logBudgetExceeded(err, qname)
+		return nil, err
+	}
+
 	btx := &btx{}
 	btx.b = b
 	btx.qname = qname
 	btx.streamIsolationID = streamIsolationID
-	return btx.Do()
+	btx.rb = rb
+
+	rrs, err = btx.Do()
+	if err != nil {
+		b.logBudgetExceeded(err, qname)
+		return nil, err
+	}
+
+	err = rb.CheckRecords(len(rrs))
+	if err == nil {
+		err = rb.CheckResponseBytes(ncdomain.ResponseBytes(rrs))
+	}
+	if err != nil {
+		b.logBudgetExceeded(err, qname)
+		return nil, err
+	}
+
+	return rrs, nil
+}
+
+// logBudgetExceeded logs a warning if err is a budget violation, recording
+// the budget category that was exceeded.
+func (b *Backend) logBudgetExceeded(err error, qname string) {
+	var bee *ncdomain.BudgetExceededError
+	if errors.As(err, &bee) {
+		log.Warnf("request resource budget exceeded: category=%s qname=%q limit=%d actual=%d",
+			bee.Category, qname, bee.Limit, bee.Actual)
+	}
 }
 
 // Things to keep track of while processing a query.
@@ -123,6 +165,8 @@ type btx struct {
 	streamIsolationID string
 
 	subname, basename, rootname string
+
+	rb *ncdomain.RequestBudget
 }
 
 func (tx *btx) Do() (rrs []dns.RR, err error) {
@@ -278,7 +322,7 @@ func (tx *btx) doUserDomain() (rrs []dns.RR, err error) {
 		return
 	}
 
-	d, err := tx.b.getNamecoinEntry(ncname, tx.streamIsolationID)
+	d, err := tx.b.getNamecoinEntry(ncname, tx.streamIsolationID, tx.rb)
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +378,7 @@ func (b *Backend) addNamecoinJSONToCache(name string, jsonValue *string, streamI
 	cache.Add(name, jsonValue)
 }
 
-func (b *Backend) getNamecoinEntry(name, streamIsolationID string) (*domain, error) {
+func (b *Backend) getNamecoinEntry(name, streamIsolationID string, rb *ncdomain.RequestBudget) (*domain, error) {
 	// Try the cache first
 	v := b.resolveNameCache(name, streamIsolationID)
 
@@ -349,7 +393,7 @@ func (b *Backend) getNamecoinEntry(name, streamIsolationID string) (*domain, err
 		b.addNamecoinJSONToCache(name, v, streamIsolationID)
 	}
 
-	d, err := b.jsonToDomain(name, *v, streamIsolationID)
+	d, err := b.jsonToDomain(name, *v, streamIsolationID, rb)
 	if err != nil {
 		return nil, err
 	}
@@ -384,16 +428,30 @@ func (b *Backend) resolveName(name, streamIsolationID string) (jsonValue string,
 	}
 }
 
-func (b *Backend) jsonToDomain(name, jsonValue, streamIsolationID string) (*domain, error) {
+func (b *Backend) jsonToDomain(name, jsonValue, streamIsolationID string, rb *ncdomain.RequestBudget) (*domain, error) {
 	d := &domain{}
 
 	resolveExtraIsolated := func(n string) (string, error) {
 		return b.resolveExtraName(n, streamIsolationID)
 	}
 
-	v := ncdomain.ParseValue(name, jsonValue, resolveExtraIsolated, nil)
+	// Surface budget violations (e.g. too many import/delegate reference
+	// resolutions) so the query fails instead of silently dropping data.
+	var budgetErr error
+	errFunc := ncdomain.ErrorFunc(func(err error, isWarning bool) {
+		var bee *ncdomain.BudgetExceededError
+		if errors.As(err, &bee) && budgetErr == nil {
+			budgetErr = bee
+		}
+	})
+
+	v := ncdomain.ParseValueWithBudget(name, jsonValue, resolveExtraIsolated, errFunc, rb)
 	if v == nil {
 		return nil, fmt.Errorf("couldn't parse value")
+	}
+
+	if budgetErr != nil {
+		return nil, budgetErr
 	}
 
 	d.ncv = v
